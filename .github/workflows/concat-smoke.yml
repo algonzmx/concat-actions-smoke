@@ -1,0 +1,223 @@
+name: Concat headless smoke test
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  render-smoke-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download and verify Concat 0.2.10
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/concat-app"
+          cd "$RUNNER_TEMP/concat-app"
+          curl -fsSL --retry 2 "https://github.com/jub0t/Concat/releases/download/v0.2.10/Concat-0.2.10-x86_64.AppImage" -o Concat.AppImage
+          echo '6399a5c9f089cf92876786d6fcee39181c997f03751fb96899b10a4c390b0a46  Concat.AppImage' | sha256sum -c -
+          chmod +x Concat.AppImage
+          ./Concat.AppImage --appimage-extract >/dev/null
+          test -x squashfs-root/AppRun
+      - name: Build synthetic stills, edit with Concat MCP, export MP4
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/concat-actions-smoke"
+          cat > "$RUNNER_TEMP/concat_smoke.py" <<'PY'
+          import json, os, struct, subprocess, sys, zlib
+
+          home = os.path.expanduser('~')
+          root = os.path.join(home, 'concat-actions-smoke')
+          media_dir = os.path.join(root, 'media')
+          os.makedirs(media_dir, exist_ok=True)
+          app = os.path.join(os.environ['RUNNER_TEMP'], 'concat-app', 'squashfs-root', 'AppRun')
+          env = os.environ.copy()
+          env['CONCAT_MCP_MODE'] = 'headless'
+          env['CONCAT_MCP_ROOTS'] = root
+          env['CONCAT_GPU_BUDGET'] = 'off'
+          stderr_path = os.path.join(root, 'concat-stderr.log')
+          stderr = open(stderr_path, 'w', encoding='utf-8')
+          proc = subprocess.Popen([app, '--mcp', 'headless'], cwd=home, env=env,
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=stderr, text=True, bufsize=1)
+          request_id = 0
+
+          def png_chunk(kind, data):
+              body = kind + data
+              return struct.pack('>I', len(data)) + body + struct.pack('>I', zlib.crc32(body) & 0xffffffff)
+
+          def make_png(path, base, accent):
+              w, h = 320, 180
+              rows = []
+              for y in range(h):
+                  row = bytearray()
+                  for x in range(w):
+                      color = accent if ((x // 40 + y // 30) % 2 == 0) else base
+                      row.extend(color)
+                  rows.append(b'\x00' + bytes(row))
+              data = b'\x89PNG\r\n\x1a\n'
+              data += png_chunk(b'IHDR', struct.pack('>2I5B', w, h, 8, 2, 0, 0, 0))
+              data += png_chunk(b'IDAT', zlib.compress(b''.join(rows), 6))
+              data += png_chunk(b'IEND', b'')
+              with open(path, 'wb') as f:
+                  f.write(data)
+
+          def rpc(method, params=None):
+              global request_id
+              request_id += 1
+              ident = request_id
+              msg = {'jsonrpc': '2.0', 'id': ident, 'method': method}
+              if params is not None:
+                  msg['params'] = params
+              proc.stdin.write(json.dumps(msg, separators=(',', ':')) + '\n')
+              proc.stdin.flush()
+              while True:
+                  line = proc.stdout.readline()
+                  if not line:
+                      raise RuntimeError('Concat MCP closed stdout during ' + method +
+                                         '; stderr: ' + open(stderr_path, encoding='utf-8').read()[-4000:])
+                  reply = json.loads(line)
+                  if reply.get('id') == ident:
+                      if 'error' in reply:
+                          raise RuntimeError(method + ' JSON-RPC error: ' + json.dumps(reply['error']))
+                      return reply.get('result', {})
+
+          def find_value(value, key):
+              if isinstance(value, dict):
+                  if key in value:
+                      return value[key]
+                  for child in value.values():
+                      found = find_value(child, key)
+                      if found is not None:
+                          return found
+              elif isinstance(value, list):
+                  for child in value:
+                      found = find_value(child, key)
+                      if found is not None:
+                          return found
+              return None
+
+          def decode_result(result):
+              if result.get('isError'):
+                  raise RuntimeError('Concat tool error: ' + json.dumps(result, ensure_ascii=False))
+              if 'structuredContent' in result:
+                  return result['structuredContent']
+              for item in result.get('content', []):
+                  text = item.get('text')
+                  if not text:
+                      continue
+                  try:
+                      return json.loads(text)
+                  except Exception:
+                      start, end = text.find('{'), text.rfind('}')
+                      if start >= 0 and end > start:
+                          try:
+                              return json.loads(text[start:end+1])
+                          except Exception:
+                              pass
+                      return text
+              return result
+
+          try:
+              rpc('initialize', {'protocolVersion': '2025-11-25', 'capabilities': {},
+                                 'clientInfo': {'name': 'concat-actions-smoke', 'version': '1.0'}})
+              proc.stdin.write(json.dumps({'jsonrpc': '2.0', 'method': 'notifications/initialized'}) + '\n')
+              proc.stdin.flush()
+              listing = rpc('tools/list', {})
+              tools = {t['name']: t for t in listing.get('tools', [])}
+              required_tools = ['concat_version', 'project_create', 'media_import',
+                                'edit_apply', 'project_save', 'export_start', 'export_wait']
+              missing = [name for name in required_tools if name not in tools]
+              if missing:
+                  raise RuntimeError('Missing expected Concat MCP tools: ' + ', '.join(missing) +
+                                     '; available: ' + ', '.join(sorted(tools)))
+
+              def call_tool(name, values):
+                  schema = tools[name].get('inputSchema', {})
+                  props = schema.get('properties', {})
+                  aliases = {
+                      'path': ['path', 'project_path', 'projectPath'],
+                      'file': ['file', 'media_path', 'mediaPath'],
+                      'job': ['job', 'job_id', 'jobId'],
+                      'command': ['command', 'edit'],
+                  }
+                  args = {}
+                  for key, value in values.items():
+                      candidates = aliases.get(key, [key])
+                      target = next((candidate for candidate in candidates if candidate in props), None)
+                      if target is not None:
+                          args[target] = value
+                  missing_args = [key for key in schema.get('required', []) if key not in args]
+                  if missing_args:
+                      raise RuntimeError('Tool ' + name + ' needs unsupported required arguments ' +
+                                         repr(missing_args) + '; schema=' + json.dumps(schema))
+                  result = rpc('tools/call', {'name': name, 'arguments': args})
+                  decoded = decode_result(result)
+                  print('TOOL ' + name + ': ' + json.dumps(decoded, ensure_ascii=False)[:3000], flush=True)
+                  return decoded
+
+              version = call_tool('concat_version', {})
+              mode = find_value(version, 'mode')
+              print('CONCAT_VERSION=' + json.dumps(version, ensure_ascii=False), flush=True)
+              make_png(os.path.join(media_dir, 'scene-1.png'), (18, 70, 140), (50, 160, 230))
+              make_png(os.path.join(media_dir, 'scene-2.png'), (120, 52, 18), (240, 170, 45))
+              project_name = 'Concat smoke test'
+              project_path = os.path.join(root, project_name)
+              call_tool('project_create', {'location': root, 'name': project_name,
+                                          'video': {'width': 320, 'height': 180, 'rateNum': 10, 'rateDen': 1}})
+              m1 = find_value(call_tool('media_import', {'path': project_path,
+                                  'file': os.path.join(media_dir, 'scene-1.png')}), 'createdId')
+              m2 = find_value(call_tool('media_import', {'path': project_path,
+                                  'file': os.path.join(media_dir, 'scene-2.png')}), 'createdId')
+              if not m1 or not m2:
+                  raise RuntimeError('Concat did not return media IDs for both synthetic PNG files')
+              call_tool('edit_apply', {'path': project_path,
+                       'command': {'op': 'addClip', 'mediaId': m1, 'trackId': 'T1', 'start': 0}})
+              call_tool('edit_apply', {'path': project_path,
+                       'command': {'op': 'addClip', 'mediaId': m2, 'trackId': 'T1', 'start': 5}})
+              call_tool('edit_apply', {'path': project_path,
+                       'command': {'op': 'addTextClip', 'above': True, 'start': 0, 'duration': 5,
+                                   'style': {'content': 'Video de prueba: escena 1', 'fontSize': 0.09}}})
+              call_tool('edit_apply', {'path': project_path,
+                       'command': {'op': 'addTextClip', 'above': True, 'start': 5, 'duration': 5,
+                                   'style': {'content': 'Video de prueba: escena 2', 'fontSize': 0.09}}})
+              call_tool('project_save', {'path': project_path})
+              output = os.path.join(root, 'concat-smoke.mp4')
+              started = call_tool('export_start', {'path': project_path, 'output': output,
+                                                   'codec': 'h264', 'crf': 28})
+              job = find_value(started, 'job')
+              if not job:
+                  raise RuntimeError('Concat export_start did not return an export job')
+              finished = call_tool('export_wait', {'job': job, 'path': project_path})
+              if not os.path.isfile(output):
+                  raise RuntimeError('Concat export_wait returned but the MP4 file is missing')
+              size = os.path.getsize(output)
+              with open(output, 'rb') as f:
+                  header = f.read(12)
+              if size < 1024 or len(header) < 12 or header[4:8] != b'ftyp':
+                  raise RuntimeError('Export is not a plausible MP4: size=' + str(size) +
+                                     ', header=' + repr(header))
+              print('EXPORT_VERIFIED path=' + output + ' bytes=' + str(size) +
+                    ' mp4_brand=' + header[8:12].decode('ascii', 'replace') +
+                    ' mcp_mode=' + str(mode) + ' job_result=' +
+                    json.dumps(finished, ensure_ascii=False)[:2000], flush=True)
+              print('VIDEO_PATH=' + output, flush=True)
+          finally:
+              if proc.poll() is None:
+                  proc.terminate()
+                  try:
+                      proc.wait(timeout=10)
+                  except subprocess.TimeoutExpired:
+                      proc.kill()
+                      proc.wait(timeout=5)
+              stderr.close()
+          PY
+          python3 "$RUNNER_TEMP/concat_smoke.py"
+      - name: Upload the synthetic test video for retrieval
+        uses: actions/upload-artifact@v4
+        with:
+          name: concat-smoke-video
+          path: ~/concat-actions-smoke/concat-smoke.mp4
+          if-no-files-found: error
+          retention-days: 1
